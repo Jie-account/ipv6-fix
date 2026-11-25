@@ -1,0 +1,16 @@
+# 个人排查现场与运行记录保留在本机。
+/evidence/
+/scripts/
+/会话行动记录.md
+/docs/*
+!/docs/usage.md
+!/docs/images/
+/dist/
+/client/test-results/
+**/Logs/
+*.pcap
+*.pcapng
+*.lnk
+/.codex/
+/.agents/
+/AGENTS.md

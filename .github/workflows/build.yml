@@ -1,0 +1,30 @@
+name: Windows build and tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test network decisions and rollback
+        shell: powershell
+        run: '& .\client\tests\Test-Core.ps1 -ProjectRoot $env:GITHUB_WORKSPACE'
+      - name: Test adaptive text layout
+        shell: powershell
+        run: '& .\client\tests\Test-Layout.ps1 -ProjectRoot $env:GITHUB_WORKSPACE'
+      - name: Build portable package
+        shell: powershell
+        run: '& .\client\Package.ps1'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPv6Repair-win-x64
+          path: |
+            dist/IPv6修复工具.exe
+            dist/IPv6Repair-win-x64.zip
+            dist/SHA256.txt
+            client/test-results/layout/summary.json

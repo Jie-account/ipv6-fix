@@ -1,0 +1,10 @@
+{
+  "Description": "Synthetic RFC 3849 addresses reproducing the stale-prefix selection failure; no personal network data.",
+  "Addresses": [
+    { "IPAddress": "fe80::10", "PreferredLifetime": { "TotalSeconds": 1000000 } },
+    { "IPAddress": "2001:db8:3::10", "PreferredLifetime": { "TotalSeconds": 172000 } },
+    { "IPAddress": "2001:db8:2::10", "PreferredLifetime": { "TotalSeconds": 2900 } },
+    { "IPAddress": "2001:db8:1::10", "PreferredLifetime": { "TotalSeconds": 2900 } }
+  ],
+  "Routes": [ { "DestinationPrefix": "2001:db8:3::/64" } ]
+}
