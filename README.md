@@ -25,7 +25,7 @@ Windows x64 便携客户端，用于检测并恢复一类 IPv6 故障：网络�
 适用于 Windows 10/11 x64，使用系统 .NET Framework、Windows PowerShell 5.1 和 curl。无需安装 Python、PowerShell 7 或第三方运行时。
 
 ~~~powershell
-git clone https://github.com/Jie-account/ipv6-fix.git
+git clone git@github.com:Jie-account/ipv6-fix.git
 cd ipv6-fix
 .\client\Package.ps1
 ~~~
@@ -34,7 +34,7 @@ cd ipv6-fix
 
 ## 验证
 
-- 15 项网络决策和恢复测试，覆盖健康状态不修改、瞬时失败、故障类型判别、部分失败、取消与回退。
+- 28 项网络决策和恢复测试，覆盖多网卡、TUN、合成 DNS、健康状态不修改、瞬时失败、取消与回退及中文记录路径。
 - 14 个布局场景，在当前系统 DPI 上使用不同文字比例，检测重叠、裁切及区块布局。
 - 合成测试使用 `2001:db8::/32` 文档地址；仓库不包含个人抓包、诊断现场或运行记录。
 - Windows 持续集成负责构建、逻辑与布局测试；实际网络修复效果按具体网络和现场验证。

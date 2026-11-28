@@ -73,6 +73,82 @@ Run-Test '已排除的地址保持原状' {
     Assert-True (-not (Get-RepairPlan $case.Inventory $case.Targets $case.Probes).CanRepair) '重复调整已排除地址'
 }
 
+# 多网卡与合成 DNS 场景仅使用内存模型，不调用真实网卡。
+function New-AdapterCase {
+    [pscustomobject]@{
+        Adapters=@([pscustomobject]@{Name='测试隧道';ifIndex=8;Status='Up';HardwareInterface=$false},[pscustomobject]@{Name='无线网络';ifIndex=9;Status='Up';HardwareInterface=$true})
+        Addresses=@([pscustomobject]@{InterfaceIndex=8;IPAddress='fd00::1';AddressState='Preferred'},[pscustomobject]@{InterfaceIndex=9;IPAddress='2001:db8::1';AddressState='Preferred'})
+        Routes=@([pscustomobject]@{InterfaceIndex=8;DestinationPrefix='::/0';RouteMetric=0;InterfaceMetric=1},[pscustomobject]@{InterfaceIndex=9;DestinationPrefix='::/0';RouteMetric=256;InterfaceMetric=35})
+    }
+}
+Run-Test '合成 DNS 与公网测试地址区分' {
+    Assert-True (-not (Test-PublicTarget '2001:2::8c')) '把 fake-ip 当成了公网目标'
+    Assert-True (-not (Test-PublicTarget 'fd00::1')) '把 ULA 当成了公网目标'
+    Assert-True (-not (Test-PublicTarget '2001:db8::1')) '把文档地址当成了公网目标'
+    Assert-True (Test-PublicTarget '2400::1') '未识别普通公网地址'
+}
+Run-Test 'TUN 优先时仍选择有公网地址的 WLAN' {
+    $case=New-AdapterCase
+    # 选择逻辑使用公网分类；此地址仅在内存中使用，不发起连接。
+    $case.Addresses[1].IPAddress='2400::1'
+    $selected=Select-IPv6Adapter $case.Adapters $case.Addresses $case.Routes
+    Assert-True ($selected.Default.Name -eq '测试隧道' -and $selected.Chosen.Name -eq '无线网络') '虚拟接口遮蔽了物理地址'
+}
+Run-Test '断开的优先接口不影响默认路径' {
+    $case=New-AdapterCase;$case.Adapters[0].Status='Disconnected';$case.Addresses[1].IPAddress='2400::1'
+    $selected=Select-IPv6Adapter $case.Adapters $case.Addresses $case.Routes
+    Assert-True ($selected.Default.Name -eq '无线网络') '选择了断开的网卡'
+}
+Run-Test '仅 ULA 隧道也保留默认路径供实际探测' {
+    $case=New-AdapterCase;$selected=Select-IPv6Adapter $case.Adapters @($case.Addresses[0]) $case.Routes
+    Assert-True ($selected.Chosen.Name -eq '测试隧道') '没有保留 ULA 默认路径'
+}
+Run-Test '没有默认路由时接口选择为空' {
+    $case=New-AdapterCase;$selected=Select-IPv6Adapter $case.Adapters $case.Addresses @()
+    Assert-True ($null -eq $selected.Chosen) '没有路由仍选择了接口'
+}
+Run-Test '虚拟默认路径下不自动修改物理源地址' {
+    $case=New-Case;$case.Inventory | Add-Member NoteProperty AlternatePath $true
+    Assert-True (-not (Get-RepairPlan $case.Inventory $case.Targets $case.Probes).CanRepair) '跨接口对照被误用为修复依据'
+}
+Run-Test '默认源地址未知时不自动修复' {
+    $case=New-Case;$case.Inventory.DefaultSources=@{}
+    Assert-True (-not (Get-RepairPlan $case.Inventory $case.Targets $case.Probes).CanRepair) '缺少默认源地址仍执行修复'
+}
+function New-PathCase {
+    [pscustomobject]@{Inventory=[pscustomobject]@{DefaultAdapterName='测试隧道';AdapterName='无线网络'};Targets=@([pscustomobject]@{Key='a'},[pscustomobject]@{Key='b'});Probes=@(foreach($key in 'a','b') {
+        [pscustomobject]@{TargetKey=$key;SourceAddress='';LocalAddress='fd00::1';Classification='Reachable'}
+        [pscustomobject]@{TargetKey=$key;SourceAddress='2001:db8::1';LocalAddress='2001:db8::1';Classification='Reachable'}
+    })}
+}
+Run-Test '默认及公网源地址成功时报告双路径结果' {
+    $case=New-PathCase
+    Assert-True ((Get-PathAssessment $case.Inventory $case.Targets $case.Probes).Status -eq 'Healthy') '双路径成功未识别'
+}
+Run-Test '仅 TUN 成功不声称原生 IPv6 健康' {
+    $case=New-PathCase;$case.Probes | Where-Object SourceAddress | ForEach-Object {$_.Classification='NetworkFailure'}
+    Assert-True ((Get-PathAssessment $case.Inventory $case.Targets $case.Probes).Title -eq '默认路径可用，原生 IPv6 尚未验证') 'TUN 掩盖了源地址失败'
+}
+Run-Test '绑定源地址与实际地址不一致不报告成功' {
+    $case=New-PathCase;$case.Probes | Where-Object SourceAddress | ForEach-Object {$_.LocalAddress='fd00::1'}
+    Assert-True ((Get-PathAssessment $case.Inventory $case.Targets $case.Probes).Status -eq 'Inconclusive') '没有核对实际本地地址'
+}
+Run-Test '源地址成功与默认失败分开反馈' {
+    $case=New-PathCase;$case.Probes | Where-Object {-not $_.SourceAddress} | ForEach-Object {$_.Classification='NetworkFailure'}
+    Assert-True ((Get-PathAssessment $case.Inventory $case.Targets $case.Probes).Title -eq '源地址可达，默认路径异常') '默认路径失败被掩盖'
+}
+Run-Test '全部失败与部分目标失败均不报告健康' {
+    $case=New-PathCase;$case.Probes | Where-Object TargetKey -eq 'b' | ForEach-Object {$_.Classification='NetworkFailure'}
+    Assert-True ((Get-PathAssessment $case.Inventory $case.Targets $case.Probes).Status -eq 'Inconclusive') '单目标成功掩盖其他失败'
+    $case.Probes | ForEach-Object {$_.Classification='NetworkFailure'}
+    Assert-True ((Get-PathAssessment $case.Inventory $case.Targets $case.Probes).Status -eq 'Inconclusive') '全部失败被判健康'
+}
+Run-Test '中文记录目录 UTF-8 往返' {
+    $directory=Join-Path $testRoot '中文目录';[void](New-Item -ItemType Directory -Path $directory)
+    $path=Join-Path $directory '检查结果.json';Save-Json $path ([pscustomobject]@{Message='无线网络检查通过'})
+    Assert-True ((Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json).Message -eq '无线网络检查通过') '中文记录未正确保存'
+}
+
 # 以下用内存中的网络模型测试备份、部分失败、验证失败和恢复流程。
 function Get-AddressRecord([string]$AdapterGuid,[string]$Address) {
     if($script:virtualAddresses.ContainsKey($Address)){return [pscustomobject]@{IPAddress=$Address;SkipAsSource=$script:virtualAddresses[$Address]}}

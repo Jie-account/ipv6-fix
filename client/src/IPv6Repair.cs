@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("IPv6 连接修复工具")]
 [assembly: AssemblyDescription("按需验证 IPv6 源地址连通性，修复已确认失效的旧源地址选择。")]
 [assembly: AssemblyProduct("IPv6 连接修复工具")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyFileVersion("1.0.2.0")]
 
 namespace IPv6Repair
 {

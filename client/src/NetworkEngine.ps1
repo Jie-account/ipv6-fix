@@ -33,6 +33,25 @@ function Get-Prefix([string]$Address, [int]$Length) {
     return ([Net.IPAddress]::new($bytes).ToString() + '/' + $Length)
 }
 
+function Test-PublicTarget([string]$Address) {
+    $ip=[Net.IPAddress]::Parse($Address)
+    if ($ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $false }
+    $bytes=$ip.GetAddressBytes()
+    # Mihomo 的 IPv6 fake-ip 位于基准测试段，不能用来验证物理网络。
+    return (($bytes[0] -band 224) -eq 32 -and (Get-Prefix $Address 48) -ne '2001:2::/48' -and (Get-Prefix $Address 32) -ne '2001:db8::/32')
+}
+
+function Resolve-PublicTarget([string]$HostName) {
+    # 仅在系统解析返回合成地址时使用独立 HTTPS DNS，不更改系统 DNS。
+    $curl=Join-Path $env:SystemRoot 'System32\curl.exe'
+    $reply=& $curl --noproxy '*' --ipv4 --silent --show-error --connect-timeout 3 --max-time 6 ('https://dns.alidns.com/resolve?name='+[Uri]::EscapeDataString($HostName)+'&type=AAAA') 2>$null
+    if ($LASTEXITCODE -ne 0) { throw '独立 IPv6 目标解析失败。' }
+    $data=($reply -join '') | ConvertFrom-Json
+    $answer=$data.Answer | Where-Object {$_.type -eq 28 -and (Test-PublicTarget $_.data)} | Select-Object -First 1
+    if (-not $answer) { throw '独立解析未返回可用于公网测试的 IPv6 地址。' }
+    return [string]$answer.data
+}
+
 function Get-Targets {
     $definitions = @(
         @{Key='campus';Name='IPv6 HTTPS';Url='https://www.tsinghua.edu.cn/'},
@@ -41,16 +60,33 @@ function Get-Targets {
     foreach ($definition in $definitions) {
         Test-Cancelled
         $uri = [Uri]$definition.Url
-        $target = [pscustomobject]@{Key=$definition.Key;Name=$definition.Name;Url=$definition.Url;HostName=$uri.DnsSafeHost;Port=$uri.Port;IPAddress='';Error=''}
+        $target = [pscustomobject]@{Key=$definition.Key;Name=$definition.Name;Url=$definition.Url;HostName=$uri.DnsSafeHost;Port=$uri.Port;IPAddress='';SystemAddresses=@();Resolution='System';Error=''}
         try {
             $lookup = [Net.Dns]::GetHostAddressesAsync($uri.DnsSafeHost)
             if (-not $lookup.Wait(5000)) { throw '解析 IPv6 地址超时。' }
             $ipv6 = @($lookup.Result | Where-Object {$_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and -not $_.IsIPv6LinkLocal})
             if ($ipv6.Count -eq 0) { throw '当前 DNS 未返回 IPv6 地址。' }
-            $target.IPAddress = $ipv6[0].ToString()
+            $target.SystemAddresses=@($ipv6 | ForEach-Object {$_.ToString()})
+            $real=$ipv6 | Where-Object {Test-PublicTarget $_.ToString()} | Select-Object -First 1
+            if ($real) { $target.IPAddress=$real.ToString() }
+            else { $target.Resolution='IndependentDns';$target.IPAddress=Resolve-PublicTarget $uri.DnsSafeHost }
         } catch { $target.Error = $_.Exception.Message }
         $target
     }
+}
+
+function Select-IPv6Adapter($Adapters,$Addresses,$Routes) {
+    # 默认路径与公网地址所在接口分别记录，ULA-only TUN 不能遮蔽物理网卡。
+    $ordered=@($Routes | Where-Object DestinationPrefix -eq '::/0' | Sort-Object @{Expression={[int]$_.RouteMetric + [int]$_.InterfaceMetric}})
+    $active=@(foreach ($route in $ordered) {
+        $Adapters | Where-Object {$_.ifIndex -eq $route.InterfaceIndex -and $_.Status -eq 'Up'} | Select-Object -First 1
+    })
+    $chosen=$active | Where-Object {
+        $index=$_.ifIndex
+        @($Addresses | Where-Object {$_.InterfaceIndex -eq $index -and (Test-PublicTarget $_.IPAddress.Split('%')[0]) -and $_.AddressState -in 'Preferred','Deprecated'}).Count -gt 0
+    } | Select-Object -First 1
+    if (-not $chosen) { $chosen=$active | Select-Object -First 1 }
+    [pscustomobject]@{Chosen=$chosen;Default=($active | Select-Object -First 1)}
 }
 
 function Get-Inventory($Targets) {
@@ -58,13 +94,10 @@ function Get-Inventory($Targets) {
     $allAddresses = @(Get-NetIPAddress -AddressFamily IPv6)
     $allRoutes = @(Get-NetRoute -AddressFamily IPv6)
     $defaultRoutes = @($allRoutes | Where-Object DestinationPrefix -eq '::/0' | Sort-Object @{Expression={[int]$_.RouteMetric + [int]$_.InterfaceMetric}})
-    $chosen = $null
-    foreach ($route in $defaultRoutes) {
-        $adapter = $adapters | Where-Object {$_.ifIndex -eq $route.InterfaceIndex -and $_.Status -eq 'Up'} | Select-Object -First 1
-        if ($adapter) { $chosen=$adapter; break }
-    }
+    $adapterSelection=Select-IPv6Adapter $adapters $allAddresses $allRoutes
+    $chosen=$adapterSelection.Chosen
     if (-not $chosen) {
-        return [pscustomobject]@{AdapterName='';AdapterGuid='';InterfaceIndex=0;Addresses=@();Routes=@();DefaultSources=@{};Fingerprint='';Issue='没有可用的 IPv6 默认路由。'}
+        return [pscustomobject]@{AdapterName='';AdapterGuid='';InterfaceIndex=0;DefaultAdapterName='';AlternatePath=$true;Addresses=@();Routes=@();DefaultSources=@{};Fingerprint='';Issue='没有可用的 IPv6 默认路由。'}
     }
     $routes = @($allRoutes | Where-Object InterfaceIndex -eq $chosen.ifIndex)
     $addresses = @(foreach ($address in $allAddresses | Where-Object InterfaceIndex -eq $chosen.ifIndex) {
@@ -80,10 +113,11 @@ function Get-Inventory($Targets) {
             HasPrefixRoute=[bool](@($routes | Where-Object DestinationPrefix -eq $prefix).Count)
         }
     })
-    $sources = @{}
+    $sources = @{}; $alternate=($adapterSelection.Default.ifIndex -ne $chosen.ifIndex -or -not $adapterSelection.Default.HardwareInterface)
     foreach ($target in $Targets | Where-Object IPAddress) {
         try {
             $selection = @(Find-NetRoute -RemoteIPAddress $target.IPAddress -ErrorAction Stop)
+            if (@($selection | Where-Object {$_.IPAddress -and $_.InterfaceIndex -ne $chosen.ifIndex}).Count -gt 0) { $alternate=$true }
             $selected = $selection | Where-Object {$_.IPAddress -and $_.InterfaceIndex -eq $chosen.ifIndex} | Select-Object -First 1
             if ($selected) { $sources[$target.Key] = [Net.IPAddress]::Parse($selected.IPAddress.Split('%')[0]).ToString() }
         } catch { }
@@ -92,8 +126,13 @@ function Get-Inventory($Targets) {
     $routeKey = ($routes | Where-Object {$_.DestinationPrefix -eq '::/0' -or $_.DestinationPrefix -like '*/64'} | Sort-Object DestinationPrefix | ForEach-Object {$_.DestinationPrefix+'/'+$_.NextHop}) -join ';'
     [pscustomobject]@{
         AdapterName=$chosen.Name;AdapterGuid=$chosen.InterfaceGuid.ToString();InterfaceIndex=[int]$chosen.ifIndex
+        DefaultAdapterName=$adapterSelection.Default.Name
+        AlternatePath=$alternate;DefaultRoutes=@($defaultRoutes | Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric,InterfaceMetric)
+        Interfaces=@(foreach ($adapter in $adapters) {
+            [pscustomobject]@{Name=$adapter.Name;InterfaceIndex=$adapter.ifIndex;HardwareInterface=$adapter.HardwareInterface;Status=$adapter.Status.ToString();Addresses=@($allAddresses | Where-Object InterfaceIndex -eq $adapter.ifIndex | Select-Object IPAddress,AddressState,PrefixOrigin,SkipAsSource,PreferredLifetime,ValidLifetime)}
+        })
         Addresses=$addresses;Routes=@($routes | Select-Object DestinationPrefix,NextHop,RouteMetric)
-        DefaultSources=$sources;Fingerprint=($chosen.InterfaceGuid.ToString()+'|'+$addressKey+'|'+$routeKey);Issue=''
+        DefaultSources=$sources;Fingerprint=($chosen.InterfaceGuid.ToString()+'|'+$addressKey+'|'+$routeKey+'|'+(($defaultRoutes | ForEach-Object {$_.InterfaceIndex.ToString()+'/'+$_.NextHop+'/'+$_.RouteMetric+'/'+$_.InterfaceMetric}) -join ';'));Issue=''
     }
 }
 
@@ -174,8 +213,31 @@ function Test-ProbePair($Probes,[string]$TargetKey,[string]$Source,[string]$Clas
     return $true
 }
 
+function Get-PathAssessment($Inventory,$Targets,$Probes) {
+    # 健康判定覆盖所有已解析目标；绑定成功还需核对实际本地地址。
+    $defaultOk=$true; $nativeOk=$true
+    foreach ($target in $Targets) {
+        if (@($Probes | Where-Object {$_.TargetKey -eq $target.Key -and -not $_.SourceAddress -and $_.Classification -eq 'Reachable'}).Count -eq 0) { $defaultOk=$false }
+        if (@($Probes | Where-Object {$_.TargetKey -eq $target.Key -and $_.SourceAddress -and $_.LocalAddress -eq $_.SourceAddress -and $_.Classification -eq 'Reachable'}).Count -eq 0) { $nativeOk=$false }
+    }
+    $context='默认路径：'+$Inventory.DefaultAdapterName+'；公网地址检查：'+$Inventory.AdapterName+'。'
+    if ($defaultOk -and $nativeOk) {
+        return [pscustomobject]@{Status='Healthy';Title='默认路径与源地址检查通过';Summary=($context+'两个路径均可访问真实 IPv6 目标。TUN 开启时，绑定源地址仍不能完全排除流量被接管。未修改设置。')}
+    }
+    if ($defaultOk) {
+        return [pscustomobject]@{Status='Inconclusive';Title='默认路径可用，原生 IPv6 尚未验证';Summary=($context+'默认访问成功，公网源地址测试未全部通过。请临时退出 TUN 后复查，以区分代理与接入网络问题。未修改设置。')}
+    }
+    if ($nativeOk) {
+        return [pscustomobject]@{Status='Inconclusive';Title='源地址可达，默认路径异常';Summary=($context+'绑定公网源地址成功，默认连接失败。请检查 TUN 路由或代理状态。未修改地址选择设置。')}
+    }
+    return [pscustomobject]@{Status='Inconclusive';Title='IPv6 连接异常，尚未确定原因';Summary=($context+'默认路径与源地址测试未全部通过；当前证据不足以修改地址。请查看记录，并在退出 TUN 后对照检查。')}
+}
+
 function Get-RepairPlan($Inventory,$Targets,$Probes) {
     # 只有同一固定目标的重复对照成立，才提出失效旧源地址的排除计划。
+    if ($Inventory.AlternatePath) {
+        return [pscustomobject]@{CanRepair=$false;WorkingAddress='';TargetKey='';ExcludeAddresses=@();Reason='默认路径涉及虚拟或其他网卡，需先区分原生通路与代理通路。'}
+    }
     $candidates=@($Inventory.Addresses | Where-Object {$_.State -eq 'Preferred' -and -not $_.SkipAsSource -and $_.Origin -eq 'RouterAdvertisement'})
     foreach ($target in $Targets | Where-Object IPAddress) {
         if (-not (Test-ProbePair $Probes $target.Key '' 'NetworkFailure')) { continue }
@@ -188,7 +250,7 @@ function Get-RepairPlan($Inventory,$Targets,$Probes) {
             })
             if ($bad.Count -eq 0) { continue }
             $selected=$Inventory.DefaultSources[$target.Key]
-            if ($selected -and $selected -notin @($bad.IPAddress)) { continue }
+            if (-not $selected -or $selected -notin @($bad.IPAddress)) { continue }
             return [pscustomobject]@{CanRepair=$true;WorkingAddress=$good.IPAddress;TargetKey=$target.Key;ExcludeAddresses=@($bad.IPAddress);Reason='重复对照证实旧前缀源地址失败，而另一前缀源地址可用。'}
         }
     }
@@ -320,13 +382,19 @@ try {
         Save-Json (Join-Path $script:JobPath 'targets.json') $targets
         if ($available.Count -eq 0) {
             $report.Status='Inconclusive';$report.Title='暂时无法完成检查';$report.Summary='测试目标的 IPv6 地址未能解析，未修改网络设置。'
-        } elseif ($inventory.Issue -or $inventory.Addresses.Count -eq 0) {
-            $report.Status='NotThisIssue';$report.Title='未发现可用的 IPv6 地址或路由';$report.Summary='当前不符合旧源地址选择故障，工具未修改设置。请检查网络接入与 IPv6 地址分配。'
         } else {
             Write-Activity '正在验证系统默认 IPv6 连接'
             $defaultRequests=@(foreach ($target in $available) { New-ProbeRequest $target '' 1 })
             $probes=@(Invoke-ProbeBatch $defaultRequests)
-            if (@($probes | Where-Object Classification -ne 'Reachable').Count -eq 0) {
+            if ($inventory.AlternatePath -or $inventory.Addresses.Count -eq 0) {
+                Write-Activity ('默认路径：'+$inventory.DefaultAdapterName+'；正在检查 '+$inventory.AdapterName+' 公网源地址')
+                $eligible=@($inventory.Addresses | Where-Object {$_.State -eq 'Preferred' -and -not $_.SkipAsSource})
+                if ($eligible.Count -gt 12) { throw '可选 IPv6 地址超过 12 个，请查看记录后进一步诊断。' }
+                $requests=@(foreach ($address in $eligible) { foreach ($target in $available) { New-ProbeRequest $target $address.IPAddress 1 } })
+                $probes+=@(Invoke-ProbeBatch $requests)
+                $assessment=Get-PathAssessment $inventory $available $probes
+                $report.Status=$assessment.Status;$report.Title=$assessment.Title;$report.Summary=$assessment.Summary
+            } elseif (@($probes | Where-Object Classification -ne 'Reachable').Count -eq 0) {
                 $report.Status='Healthy';$report.Title='当前 IPv6 连接正常';$report.Summary='默认 IPv6 访问已通过测试，无需修改地址选择设置。'
             } else {
                 $eligible=@($inventory.Addresses | Where-Object {$_.State -eq 'Preferred' -and -not $_.SkipAsSource -and $_.Origin -eq 'RouterAdvertisement'})
@@ -385,6 +453,9 @@ try {
 } catch {
     $report.Status='Error';$report.Title='本次操作未完成';$report.Summary=$_.Exception.Message;$report.Error=$_.ToString()
 } finally {
+    if ($targets.Count -gt 0 -and @($targets | Where-Object {-not $_.IPAddress}).Count -gt 0 -and $report.Status -eq 'Healthy') {
+        $report.Status='Inconclusive';$report.Title='部分 IPv6 测试通过';$report.Summary+=' 部分目标解析失败，完整连接状态尚未验证。'
+    }
     if ($inventory) {
         try { $finalInventory=Get-Inventory $targets;Save-Json (Join-Path $script:JobPath 'after.json') $finalInventory;$report.Addresses=@(Get-AddressViews $finalInventory $probes) }
         catch { $report.Addresses=@(Get-AddressViews $inventory $probes) }
